@@ -39,14 +39,18 @@ def lconvista(config, shrinkage):
     Z = T.zeros(config['Zinit'])
 
     def rec_error(X,Z,D):
-        rec = nconv(Z,D,image_shape=config['Zinit'],filter_shape=_D.shape) #rec.shape == X.shape
+        rec = nconv(Z,D,border_mode='valid',image_shape=config['Zinit'],filter_shape=_D.shape) #rec.shape == X.shape
         rec_error = T.mean(theano.map(lambda Xi, reci: T.sum((Xi - reci)**2) , sequences=[X,rec])[0]) #alternative: T.mean( T.sum( T.sum( (x - rec)**2 , axis=3 ) , axis=2 ) )
         return rec_error
 
 
 #################### TODO
     for i in range(layers):
-        Z = shrinkage(Z - 1/L * T.grad(rec_error(X,Z,D),Z), theta)
+        gradZ = nconv(nconv(Z,D,border_mode='valid',image_shape=config['Zinit'],filter_shape=_D.shape) - X , D[:,:,::-1,::-1].dimshuffle(1,0,2,3), border_mode='full')
+        Z = shrinkage(Z - 1/L * gradZ, theta)
+        
+        
+        #Z = shrinkage(Z - 1/L * T.grad(rec_error(X,Z,D),Z), theta)
 
 
 
@@ -104,7 +108,7 @@ if __name__ == '__main__':
     Dinit = {"shape": (n_filters,filter_size,filter_size), "variant": "normal", "std": 0.1}
     D = crino.initweight(**Dinit)#np.random.randn(n_filters*s,s)#
     # normalize atoms (SQUARE patches) to 1
-    D = D / np.sqrt(np.asarray(map(lambda patch: (patch**2).sum(keepdims=True),D)))
+    D /= np.sqrt(np.asarray(map(lambda patch: (patch**2).sum(keepdims=True),D)))
     # reshape to four dimensions to match nnet.conv.conv2d
     D = D.reshape(1,n_filters,filter_size,filter_size)
     
