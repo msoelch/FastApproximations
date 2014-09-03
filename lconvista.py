@@ -42,25 +42,42 @@ def lconvista(config, shrinkage):
     #X.shape = (btsz, singleton dimension, h, w)
     X = T.tensor4('X',dtype=theano.config.floatX)
     #Z.shape = (btsz, n_filters, h+s-1, w+s-1)
-    Z = 0.5*T.ones(config['Zinit'],dtype=theano.config.floatX)#nconv(-X , D[:,:,::-1,::-1].dimshuffle(1,0,2,3), border_mode='full', image_shape=config['Xshape'], filter_shape=fs2)#T.zeros(config['Zinit'],dtype=theano.config.floatX)
+    Z = 2*T.ones(config['Zinit'],dtype=theano.config.floatX)#nconv(-X , D[:,:,::-1,::-1].dimshuffle(1,0,2,3), border_mode='full', image_shape=config['Xshape'], filter_shape=fs2)#T.zeros(config['Zinit'],dtype=theano.config.floatX)
+
+    def rec_error(X,Z,D):
+        rec = nconv(Z,D,border_mode='valid',image_shape=config['Zinit'],filter_shape=_D.shape) #rec.shape == X.shape
+        #rec_error = 0.5*T.mean( T.sum(T.sum((rec-X)**2,axis=-1),axis=-1) )
+        rec_error = 0.5*T.mean(theano.map(lambda Xi, reci: T.sum((reci-Xi)**2) , sequences=[X,rec])[0]) #alternative: T.mean( T.sum( T.sum( (x - rec)**2 , axis=3 ) , axis=2 ) )
+        return rec_error, rec
+
+    def gradZ(X,Z,D,theanograd=False):
+        if theanograd:
+            return T.grad(rec_error(X,Z,D)[0],Z)
+        else:
+            return nconv( nconv(Z,D,border_mode='valid',image_shape=config['Zinit'],filter_shape=fs1) - X , D[:,:,::-1,::-1].dimshuffle(1,0,2,3), border_mode='full', image_shape=config['Xshape'], filter_shape=fs2) / btsz
+
+    #Z = theano.scan(lambda Z,X,D,L,theta: shrinkage(Z - 1/L * gradZ(X,Z,D),theta), outputs_info=Z, non_sequences=[X,D,L,theta], n_steps=layers)[0][-1]
 
 
     for i in range(layers):
-        gradZ = nconv( nconv(Z,D,border_mode='valid',image_shape=config['Zinit'],filter_shape=fs1) - X ,
-                      D[:,:,::-1,::-1].dimshuffle(1,0,2,3), border_mode='full', image_shape=config['Xshape'], filter_shape=fs2) / btsz
-        Z = shrinkage(Z - 1/L * gradZ, theta) 
-        #Z = shrinkage(Z - 1/L * T.grad(rec_error(X,Z,D),Z), theta) #this grad is 1/btsz smaller due to T.mean instead of T.sum in rec_error
+        #gradZ = nconv( nconv(Z,D,border_mode='valid',image_shape=config['Zinit'],filter_shape=fs1) - X ,
+        #              D[:,:,::-1,::-1].dimshuffle(1,0,2,3), border_mode='full', image_shape=config['Xshape'], filter_shape=fs2) / btsz
+        #Z = shrinkage(Z - 1/L * gradZ, theta) 
+        #Z = shrinkage(Z - 1/L * T.grad(rec_error(X,Z,D)[0],Z), theta) #this grad is 1/btsz smaller due to T.mean instead of T.sum in rec_error
+        Z = shrinkage(Z - 1/L * gradZ(X,Z,D),theta)
 
     #def rec_error(X,Z,D):
-    rec = nconv(Z,D,border_mode='valid',image_shape=config['Zinit'],filter_shape=_D.shape) #rec.shape == X.shape
-    rec_error = 0.5*T.mean(theano.map(lambda Xi, reci: T.sum((reci-Xi)**2) , sequences=[X,rec])[0]) #alternative: T.mean( T.sum( T.sum( (x - rec)**2 , axis=3 ) , axis=2 ) )
+    #rec = nconv(Z,D,border_mode='valid',image_shape=config['Zinit'],filter_shape=_D.shape) #rec.shape == X.shape
+    #rec_error = 0.5*T.mean(theano.map(lambda Xi, reci: T.sum((reci-Xi)**2) , sequences=[X,rec])[0]) #alternative: T.mean( T.sum( T.sum( (x - rec)**2 , axis=3 ) , axis=2 ) )
     #    return rec_error
 
-    
-    sparsity = T.mean(theano.map(lambda Zi: T.sum(T.abs_(Zi)),Z)[0])#alternative: mean also over filter index dimension (axis 1), not just axis 0
-    cost = rec_error + sp_lmbd * sparsity
+    sparsity = T.mean(T.sum(T.sum(T.abs_(Z),axis=-1),axis=-1))
+    #sparsity = T.mean(theano.map(lambda Zi: T.mean(theano.map(lambda Zij: T.sum(T.abs_(Zij)), Zi)[0]), Z)[0])
+    #sparsity = T.mean(theano.map(lambda Zi: T.sum(T.abs_(Zi)),Z)[0])#alternative: mean also over filter index dimension (axis 1), not just axis 0
+    re, rec = rec_error(X,Z,D)    
+    cost = re + sp_lmbd * sparsity
 
-    return X, params, cost, Z, rec, (rec_error,sparsity)
+    return X, params, cost, Z, rec, (re,sparsity)
 
 
 
@@ -87,7 +104,7 @@ if __name__ == '__main__':
     ####################  
     epochs = 20
     btsz = 100
-    lr = 1
+    lr = .1
     momentum = 0.9
     decay = 0.95
     batches = data.shape[0]/btsz
@@ -101,8 +118,8 @@ if __name__ == '__main__':
     #################### 
     n_filters = 100
     filter_size = 5 #filters assumed to be square
-    layers = 3
-    lmbd = 0.01 # sparsity weight
+    layers = 10
+    lmbd = .1 # sparsity weight
     
     Dinit = {"shape": (n_filters,filter_size,filter_size), "variant": "normal", "std": 0.5}
     D = crino.initweight(**Dinit)#np.random.randn(n_filters*s,s)#
@@ -111,7 +128,7 @@ if __name__ == '__main__':
     # reshape to four dimensions to match nnet.conv.conv2d
     D = D.reshape(1,n_filters,filter_size,filter_size)
     
-    theta = 0.1 # potentially adjust to size of Z, keep it simple in the beginning
+    theta = 0.166 # potentially adjust to size of Z, keep it simple in the beginning
 
     L = 1.
 
@@ -148,7 +165,7 @@ if __name__ == '__main__':
     updates = crino.max_updt(params, updates, todo=thresh_dic)
 
     #train = theano.function([x], (x, params[0], cost, z, rec, es[0], es[1]), updates=updates, allow_input_downcast=True)
-    train = theano.function([x], (cost,es[0],es[1]), updates=updates, allow_input_downcast=True)
+    train = theano.function([x], (cost,es[0],es[1],params[1],params[2]), updates=updates, allow_input_downcast=True)
 
     print 'Graph built.'
 
@@ -162,10 +179,10 @@ if __name__ == '__main__':
         for mbi in xrange(batches):
             #x, params, cost, z, rec = train(data[mbi*btsz:(mbi+1)*btsz]) 
             #x, params, newcost, z, rec, re, sp = train(data[mbi*btsz:(mbi+1)*btsz])
-            newcost, re, sp = train(data[mbi*btsz:(mbi+1)*btsz])
+            newcost, re, sp, theta, L = train(data[mbi*btsz:(mbi+1)*btsz])
             cost += btsz*newcost
             #cost += btsz*train(data[mbi*btsz:(mbi+1)*btsz])
-            print re,sp
+            print re,sp, np.asarray(theta), np.asarray(L)
             #print re, sp, (x**2).sum, (rec**2).sum, (z**2).sum()
             if (mbi+1) % 50 == 0:
                 print "mbi", mbi
