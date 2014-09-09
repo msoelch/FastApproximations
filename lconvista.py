@@ -94,25 +94,34 @@ def classifier(config, shrinkage):
     y = T.ivector('y')
 
     ####################
+    # INTERMEDIATE CNN LAYER
+    #################### 
+    _WCNN = config['WCNN']
+    WCNN = theano.shared(value=np.asarray(_WCNN, 
+            dtype=theano.config.floatX),borrow=True,name='WCNN')
+    header_params = [WCNN]
+
+    H = conv(Z,WCNN,border_mode='full')
+
+    ####################
     # LOGISTIC REGRESSION LAYER
     ####################  
     btsz = config['btsz']
-    hiddenUnits = np.asarray(config['Zinit'][1:]).prod(dtype=np.int32)
-    lrLayer = LR(input=Z.reshape(shape=(btsz,hiddenUnits)),
+    hiddenUnits = _WCNN.shape[0] * (config['Zinit'][-2] + _WCNN.shape[2] - 1) * (config['Zinit'][3] + _WCNN.shape[3] - 1)#np.asarray(config['Zinit'][1:]).prod(dtype=np.int32)
+    lrLayer = LR(input=H.reshape(shape=(btsz,hiddenUnits)),
                                             n_in=hiddenUnits, n_out=10)
     neglog = lrLayer.negative_log_likelihood(y)
     cerror = lrLayer.errors(y)
-    params = params + lrLayer.params
+    header_params = header_params + lrLayer.params
 
     ####################
     # TOTAL CLASSIFIER ERROR
     ####################  
     err_weights = config["err_weights"]
-    cost = (err_weights[0] * re 
-                + err_weights[1] * sparsity 
-                + err_weights[2] * neglog)
+    costFE = err_weights[0] * re + err_weights[1] * sparsity 
+    costCL = err_weights[2] * neglog
 
-    return X, y, params, Z, rec, cost, cerror, re, sparsity, neglog
+    return X, y, params, header_params, Z, rec, costFE, costCL, cerror, re, sparsity, neglog
 
 
 
@@ -163,15 +172,11 @@ def runClassifier():
     err_weights = (weight_reconstruction,weight_sparsity,weight_neglog)
 
     
-    Dinit = {"shape": (n_filters,filter_size,filter_size),
+    Dinit = {"shape": (1,n_filters,filter_size,filter_size),
              "variant": "normal", "std": 0.5}
     D = crino.initweight(**Dinit)#np.random.randn(n_filters*s,s)#
     # normalize atoms (SQUARE patches) to 1
-    D /= np.sqrt(
-            np.asarray(map(lambda patch: (patch**2).sum(keepdims=True),D))
-         )
-    # reshape to four dimensions to match nnet.conv.conv2d
-    D = D.reshape(1,n_filters,filter_size,filter_size)
+    D /= np.sqrt((D**2).sum(axis=-2,keepdims=True).sum(axis=-1,keepdims=True))
     
     theta = 0.001
 
@@ -182,9 +187,18 @@ def runClassifier():
                    data[0,0].shape[1]+filter_size-1)
     Xshape = data[:btsz].shape
 
+
+    filter_size_W = 7
+    n_output_filters = np.round(n_filters/10.)
+    Winit =  {"shape": (n_output_filters,n_filters,filter_size_W,filter_size_W), "variant": "normal", "std": 0.5}
+    W = crino.initweight(**Winit)
+    W /= np.sqrt((W**2).sum(axis=-2,keepdims=True).sum(axis=-1,keepdims=True))
+    
+
+
     config = {"D": D, "theta": theta, "L": L, "Zinit": zinit_shape,
               "layers": layers, "Xshape": Xshape, "btsz": btsz,
-              "err_weights": err_weights}
+              "err_weights": err_weights, "WCNN": W}
     
     # normalize weights according to this config
     norm_dic = {"D": {"axis":1, "c": 1.}}
@@ -195,8 +209,9 @@ def runClassifier():
     ####################
     # BUILDING GRAPH
     #################### 
-    X, y, params, Z, rec, cost, cerror, re, sparsity, neglog = classifier(config=config, shrinkage=sh)
-    grads = T.grad(cost, params)
+    X, y, params, header_params, Z, rec, costFE, costCL, cerror, re, sparsity, neglog = classifier(config=config, shrinkage=sh)
+    grads = T.grad(costFE, params)
+    header_grads = T.grad(costCL, header_params)
 
     # training ...
     settings = {"lr": lr, "momentum": momentum, "decay": decay}
@@ -210,9 +225,20 @@ def runClassifier():
     # ... make sure threshold is big enough
     updates = crino.max_updt(params, updates, todo=thresh_dic)
 
-    train = theano.function([X,y],
-                (cost, cerror, re, sparsity, neglog) + tuple(params),
+
+
+    header_updates = crino.adadelta(header_params, header_grads, settings)
+
+
+
+    trainFE = theano.function([X],
+                (costFE, re, sparsity) + tuple(params),
                 updates=updates, allow_input_downcast=True)
+
+    trainCL = theano.function([X,y],
+                (costCL, neglog) + tuple(header_params),
+                updates=header_updates, allow_input_downcast=True)
+
     validate_or_test_model = theano.function([X,y],
                 cerror, allow_input_downcast=True)
     print 'Graph built.'
@@ -235,8 +261,8 @@ def runClassifier():
                                   # on the validation set; in this case we
                                   # check every epoch
 
-    best_params = [None] * 5
-    params = [None] * 5
+    best_params = [None] * 6
+    params = [None] * 6
     best_validation_loss = np.inf
     best_iter = 0
     test_score = 0.
@@ -249,7 +275,7 @@ def runClassifier():
         start = time.clock()
         epoch += 1
         for mbi in xrange(batches):
-            newcost, cerror, re, sparsity, neglog, params[0], params[1], params[2], params[3], params[4] = train(data[mbi*btsz:(mbi+1)*btsz],dtrgts[mbi*btsz:(mbi+1)*btsz])
+            newcost, cerror, re, sparsity, neglog, params[0], params[1], params[2], params[3], params[4], params[5] = train(data[mbi*btsz:(mbi+1)*btsz],dtrgts[mbi*btsz:(mbi+1)*btsz])
             cost += btsz*newcost
             # iteration number
             iter = (epoch - 1) * batches + mbi
