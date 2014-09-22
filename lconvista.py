@@ -6,14 +6,14 @@ import gzip, cPickle
 import time
 from osdfutils import crino
 import os
-
 from convolutional_mlp import HiddenLayer, LeNetConvPoolLayer, LogisticRegression
+from ksparse import kSparse
+
 
 def sh(x, theta):
     """Simple shrinkage function.
     """
     return T.sgn(x) * T.maximum(0, T.abs_(x) - theta)
-
 
 
 def lconvista(config, shrinkage):
@@ -24,7 +24,8 @@ def lconvista(config, shrinkage):
     print "[LConvISTA]"
 
     layers = config['layers']
-   # btsz = theano.shared(value=np.asarray(config['btsz'],dtype=theano.config.floatX), borrow=True, name='btsz')
+
+    k = config['k']
       
     _D = config['D']
     D = theano.shared(value=np.asarray(_D, 
@@ -43,7 +44,7 @@ def lconvista(config, shrinkage):
         
     #filter shape information for speed up of convolution
     fs1 = _D.shape
-    fs2 = _D180.shape#(fs1[1],fs1[0],fs1[2],fs1[3])
+    fs2 = _D180.shape
 
     #need tensor4:s due to interface of nnet.conv.conv2d
     #X.shape = (btsz, singleton dimension, h, w)
@@ -58,7 +59,6 @@ def lconvista(config, shrinkage):
     # on CPU with 2 layers and 16 filters as well as 5 layers and 49 filters.
     # Note though that T.grad catches up with increasing parameters.
     # Hand calculated grad is preferred due to higher flexibility. 
-    
     for i in range(layers):    
         gradZ = conv(
                     conv(
@@ -67,52 +67,82 @@ def lconvista(config, shrinkage):
                         ) - X,
                     D180,border_mode='full',
                     image_shape=config['Xshape'], filter_shape=fs2
-                    )# / btsz
-        Z = shrinkage(Z - 1/L * gradZ,theta)
+                    )
+        step = Z - 1/L * gradZ
+        ksZ = kSparse(step,k)
+        Z = shrinkage(step,theta) - shrinkage(ksZ,theta) + ksZ
 
 
     def rec_error(X,Z,D):
         # Calculates the reconstruction rec_i = sum_j Z_ij * D_j
         # and the corresponding (mean) square reconstruction error
         # rec_error = (X_i - rec_i) ** 2
-
         rec = conv(Z,D,border_mode='valid',
                     image_shape=config['Zinit'],filter_shape=_D.shape) 
         rec_error = 0.5*T.mean(((X-rec)**2).sum(axis=-1).sum(axis=-1))
         return rec_error, rec
 
 
-    sparsity = T.mean(T.sum(T.sum(T.abs_(Z),axis=-1),axis=-1))
+    sparsity = T.mean(T.sum(T.sum(T.abs_(kSparse(Z,k) - Z),axis=-1),axis=-1))
     re, rec = rec_error(X,Z,D)    
 
     return X, params, Z, rec, re, sparsity
 
 
+def classifier(Z, Zinit):
+   # Z = T.tensor4('Z')
+    y = T.ivector('y')
 
-def trainFE(l,f,e):
-    ####################
-    # READ AND FORMAT DATA
-    ####################    
-    mnist_f = gzip.open("mnist.pkl.gz",'rb')                              
-    train_set, valid_set, test_set = cPickle.load(mnist_f)                
+    rng = np.random.RandomState()
 
-    dm = train_set[0].mean(axis=0)
+    # Construct the first convolutional pooling layer:
+    # filtering reduces the image size to (32-5+1,32-5+1)=(28,28)
+    # maxpooling reduces this further to (28/2,28/2) = (14,14)
+    # 4D output tensor is thus of shape (btsz,firstfilters,14,14)
+    firstfilters = 20
+    layer0 = LeNetConvPoolLayer(rng, Z,
+            image_shape=Zinit,
+            filter_shape=(firstfilters, Zinit[1], 5, 5), poolsize=(1, 1))
 
-    data = (train_set[0] - dm).reshape(train_set[0].shape[0],1,28,28)
-    dtrgts = train_set[1]
-    valid = (valid_set[0] - dm).reshape(valid_set[0].shape[0],1,28,28)
-    vtrgts = valid_set[1]
-    test = (test_set[0] - dm).reshape(test_set[0].shape[0],1,28,28)
-    ttrgts = test_set[1]
+    # Construct the second convolutional pooling layer
+    # filtering reduces the image size to (14-5+1,14-5+1)=(10, 10)
+    # maxpooling reduces this further to (10/2,10/2) = (5, 5)
+    # 4D output tensor is thus of shape (btsz,secondfilters,5,5)
+    secondfilters=50    
+    layer1 = LeNetConvPoolLayer(rng, input=layer0.output,
+            image_shape=(Zinit[0], firstfilters, 28, 28),
+            filter_shape=(secondfilters, firstfilters, 5, 5), poolsize=(1, 1))
 
-    mnist_f.close()
-   
+    # the HiddenLayer being fully-connected, it operates on 2D matrices of
+    # shape (batch_size,num_pixels) (i.e matrix of rasterized images).
+    # This will generate a matrix of shape (btsz, secondfilters*5*5)
+    layer2_input = layer1.output.flatten(2)
+
+    # construct a fully-connected sigmoidal layer
+    layer2 = HiddenLayer(rng, input=layer2_input,
+                         n_in=50*24*24, n_out=500,
+                         activation=T.tanh)
+
+    # classify the values of the fully-connected sigmoidal layer
+    layer3 = LogisticRegression(input=layer2.output, n_in=500, n_out=10)
+
+    # the cost we minimize during training is the NLL of the model
+    neglog = layer3.negative_log_likelihood(y)
+    cerror =  layer3.errors(y)
+    # create a list of all model parameters to be fit by gradient descent
+    params = layer3.params + layer2.params + layer1.params + layer0.params
+
+    return neglog, cerror, params, Z, y
+
+
+def trainFE(l,f,fs,e,k):
+    data, dtrgts, valid, vtrgts, test, ttrgts =  getMNIST(square=True)
     ####################
     # SET LEARNING PARAMETERS
     ####################  
     epochs = e
     btsz = 100
-    lr = .01
+    lr = .05
     momentum = 0.9
     decay = 0.95
     batches = data.shape[0]/btsz
@@ -127,11 +157,13 @@ def trainFE(l,f,e):
     # INITIALIZE ALGORITHM PARAMETERS
     #################### 
     n_filters = f
-    filter_size = 5 #filters assumed to be square
+    filter_size = fs #filters assumed to be square
     layers = l
+    k = k
     w_re = 1.
-    w_sparsity = .1
-    print('%i filters of size %i x %i, %i layers' % (n_filters, filter_size, filter_size, layers))
+    w_sparsity = 1.
+    print('%i filters of size %i x %i, %i layers' %
+          (n_filters, filter_size, filter_size, layers))
 
     
     
@@ -142,7 +174,7 @@ def trainFE(l,f,e):
     D /= np.sqrt((D**2).sum(axis=-2,keepdims=True).sum(axis=-1,keepdims=True))
 
     D180 = D[:,:,::-1,::-1].swapaxes(0,1)#D[:,:,::-1,::-1].dimshuffle(1,0,2,3)
-    L = 15.#25.#1.    
+    L = 50.#25.#1.    
     theta = w_sparsity / L#0.001
 
 
@@ -153,7 +185,7 @@ def trainFE(l,f,e):
     Xshape = data[:btsz].shape
 
 
-    config = {"D": D, "D180": D180, "theta": theta, "L": L, "Zinit": zinit_shape,
+    config = {"D": D, "D180": D180, "theta": theta, "L": L, "k": k, "Zinit": zinit_shape,
               "layers": layers, "Xshape": Xshape, "btsz": btsz}
     
     # normalize weights according to this config
@@ -228,6 +260,7 @@ def trainFE(l,f,e):
         cost = 0
         for mbi in xrange(batches):
             cost, Z, re, sparsity, params[0], params[1], params[2], params[3] = train(data[mbi*btsz:(mbi+1)*btsz])
+
             
             # iteration number
             iter = (epoch - 1) * batches + mbi
@@ -240,7 +273,7 @@ def trainFE(l,f,e):
                 this_validation_loss = np.mean(np.asarray(validation_losses),axis=0)
 
 
-                print('epoch %i, minibatch %i/%i, validation set reconstruction error %f, sparsity %f, total error %f' % (epoch, mbi + 1, batches, this_validation_loss[1],this_validation_loss[2],this_validation_loss[0]))
+                print(' epoch %i, minibatch %i/%i, validation set reconstruction error %f, sparsity %f, total error %f' % (epoch, mbi + 1, batches, this_validation_loss[1],this_validation_loss[2],this_validation_loss[0]))
 
 
                 if this_validation_loss[0] < best_validation_loss:
@@ -255,449 +288,229 @@ def trainFE(l,f,e):
                     test_losses = [validate(test[i*btsz:(i+1)*btsz]) for i in xrange(tbatches)]
                     test_score = np.mean(np.asarray(test_losses),axis=0)
 
-                    print('     epoch %i, minibatch %i/%i, validation set reconstruction error %f, sparsity %f, total error %f' % (epoch, mbi + 1, batches, test_score[1],test_score[2],test_score[0]))
+                    print('  epoch %i, minibatch %i/%i, validation set reconstruction error %f, sparsity %f, total error %f' % (epoch, mbi + 1, batches, test_score[1],test_score[2],test_score[0]))
 
             if patience <= iter:
                     done_looping = True
                     break
         end = time.clock()
         print "Elapsed time for last epoch", end-start, "seconds"
-    
-
-
-    
-            
-    name = 'epochs%i_layers%i_filters%i_shape%i' % (epochs,layers,n_filters,filter_size)
-    directory = "experiments/"+name
-    if not os.path.exists(directory):
-        os.makedirs(directory)
-    f = gzip.open("experiments/"+name+"/sparse.pkl.gz",'wb')
-    cPickle.dump(best_params, f)
-                
+        name = 'epochs%i_layers%i_k%i_filters%i_shape%i_lambda%f' % (epochs,layers,k,n_filters,filter_size,w_sparsity)
+        directory = "experiments/"+name
+        if not os.path.exists(directory):
+            os.makedirs(directory)
+        filename = "sparse_epoch%i.pkl.gz" % (epoch)
+        file = gzip.open("experiments/"+name+"/"+filename,'wb')
+        cPickle.dump(best_params + [l,f,fs,k], file)  
+        file.close()       
             
     return best_params,Z
 
 
-
 def testClassification():
+    data, dtrgts, valid, vtrgts, test, ttrgts =  getMNIST(square=True)
+
     layers = 10
     n_filters = 16
     filter_size = 5
 
-    ####################
-    # READ AND FORMAT DATA
-    ####################  
-
-    mnist_f = gzip.open("mnist.pkl.gz",'rb')                              
-    train_set, valid_set, test_set = cPickle.load(mnist_f)                
-
-    dm = train_set[0].mean(axis=0)
-
-    data = (train_set[0][::2] - dm).reshape(train_set[0][::2].shape[0],1,28,28)
-    dtrgts = train_set[1][::2]
-    n_tr_samples = dtrgts.size
-
-    valid = (valid_set[0][::2] - dm).reshape(valid_set[0][::2].shape[0],1,28,28)
-    vtrgts = valid_set[1][::2]
-    n_va_samples = vtrgts.size
-
-    test = (test_set[0][::2] - dm).reshape(test_set[0][::2].shape[0],1,28,28)
-    ttrgts = test_set[1][::2]
-    n_te_samples = ttrgts.size
-
-    x = np.concatenate((data,valid,test))
-
-    mnist_f.close()
-
-
-    file = "experiments/epochs50_layers10_filters16_shape5/sparse.pkl.gz"  
-    print file
+    file = "experiments/epochs100_layers10_filters16_shape5/sparse.pkl.gz"  
     f = gzip.open(file,'rb')                              
     params = cPickle.load(f)                
     f.close()
-
-    D = np.asarray(params[0].astype(np.float32),dtype=theano.config.floatX)
-    D180 = np.asarray(params[1].astype(np.float32),dtype=theano.config.floatX)
-    theta = np.asarray(params[2].astype(np.float32),dtype=theano.config.floatX)
-    L = np.asarray(params[3].astype(np.float32),dtype=theano.config.floatX)
-
-    zinit_shape = (x.shape[0],n_filters,
-                   data[0,0].shape[0]+filter_size-1,
-                   data[0,0].shape[1]+filter_size-1)
-
-    btsz = 25000
-
-    config = {"D": D, "D180": D180, "theta": theta, "L": L, "Zinit": zinit_shape,
-              "layers": layers, "Xshape": x.shape, "btsz": btsz}#x.shape[0]}
-
-    X, params, Z, rec, re, sparsity = lconvista(config,sh)
-
-    extract = theano.function([X], Z, allow_input_downcast=True)
-
-    allZ = extract(x)
-    print x.shape
-    print allZ.shape
-    print np.count_nonzero(allZ)
-
-    trainZ = allZ[:n_tr_samples]
-    validZ = allZ[n_tr_samples:n_tr_samples+n_va_samples]
-    testZ = allZ[n_tr_samples+n_va_samples:]
-    
+    D = np.asarray(params[0],dtype=theano.config.floatX)
+    D180 = np.asarray(params[1],dtype=theano.config.floatX)
+    theta = np.asarray(params[2],dtype=theano.config.floatX)
+    L = np.asarray(params[3],dtype=theano.config.floatX)
 
     btsz = 100
-    batches = data.shape[0]/btsz
-    tbatches = test.shape[0]/btsz
-    vbatches = valid.shape[0]/btsz
-    Zinit =  (btsz,) + trainZ.shape[1:]
+    zinit_shape = (btsz,n_filters,
+                   data[0,0].shape[0]+filter_size-1,
+                   data[0,0].shape[1]+filter_size-1)
+    
+    config = {"D": D, "D180": D180, "theta": theta, "L": L, "Zinit": zinit_shape,
+              "layers": layers, "Xshape": (btsz,1,28,28), "btsz": btsz}
 
-    neglog, cerror, cparams, Z, y = classifier(Zinit)
-    grads = T.grad(neglog,cparams)
+
+
+
+
+
+
+    X, params, Z, rec, re, sparsity = lconvista(config,sh)
+    #extract = theano.function([X], Z, allow_input_downcast=True)
+
+    neglog, cerror, cparams, Z, y = classifier(Z, zinit_shape)
+    
+ 
+
+    
+
+
+
+
     # training ...
-    lr = 1.
+    lr = .5
     momentum = 0.9
     decay = 0.95
     settings = {"lr": lr, "momentum": momentum, "decay": decay}
-    # ... with stochastic gradient + momentum
-    #updates = crino.momntm(params, grads, settings)#, **norm_dic)
-    updates = crino.adadelta(cparams, grads, settings)#, **norm_dic)
-
-
-    train = theano.function([Z,y], (neglog,cerror), updates=updates, allow_input_downcast=True)
-    validate = theano.function([Z,y], (neglog,cerror), allow_input_downcast=True)
     
 
 
+    grads = T.grad(neglog,cparams)
+    updates = crino.adadelta(cparams, grads, settings)
+    train = theano.function([X,y], (neglog,cerror),
+                            updates=updates, allow_input_downcast=True)
 
+
+
+    lr = .1
+    momentum = 0.9
+    decay = 0.95
+    settings = {"lr": lr, "momentum": momentum, "decay": decay}
+
+
+    fullgrads = T.grad(neglog,params+cparams)
+    fullupdates = crino.adadelta(params+cparams, fullgrads, settings)
+    trainBoth = theano.function([X,y], (neglog,cerror),
+                            updates=fullupdates, allow_input_downcast=True)
+
+
+
+
+    validate = theano.function([X,y], (neglog,cerror),
+                               allow_input_downcast=True)
+
+
+
+    trainBothC = lambda X, y: trainBoth(X,y)#extract(X),y)
+    trainC = lambda X, y: train(X,y)#extract(X),y)
+    validateC = lambda X, y: validate(X,y)#extract(X),y)
+    
+
+
+    classificationTraining(data, dtrgts, valid, vtrgts, test, ttrgts,
+                           btsz, (trainC,trainBothC), validateC, epochs=100, patience=2500,
+                           patience_inc=1.6,  improvement=0.995)
+
+
+
+
+
+
+
+
+
+
+
+def classificationTraining(data, dtrgts, valid, vtrgts, test, ttrgts,
+                           btsz, train, validate, epochs=20, patience=2500,
+                           patience_inc=1.6,  improvement=0.995):
     print '... training'
 
+    batches = data.shape[0]/btsz
+    tbatches = test.shape[0]/btsz
+    vbatches = valid.shape[0]/btsz
+
+
     # early-stopping parameters
-    patience = 2500  # look as this many examples regardless
-    patience_increase = 1.6  # wait this much longer when a new best is
-                           # found
-    improvement_threshold = 0.995  # a relative improvement of this much is
-                                   # considered significant
+    # patience: look as this many examples regardless
+    # patience_inc = wait this much longer when a new best is found
+    # improvement: a rel. improvement of this much is significant
     validation_frequency = min(batches, patience / 2)
                                   # go through this many
                                   # minibatche before checking the network
                                   # on the validation set; in this case we
                                   # check every epoch
 
-    
-    #params = [None] * 4
-    #best_params = params
-
     best_validation_loss = np.inf
     best_iter = 0
     test_score = 0.
-    start_time = time.clock()
-
-    epochs = 20
+    
     epoch = 0
     done_looping = False
 
+    t = 0 # training procedure flag
+
     while (epoch < epochs) and (not done_looping):
-        print '-----------'
         start = time.clock()
         epoch += 1
         cost = 0
+        error = 0
+
         for mbi in xrange(batches):
-            neglog, cerror = train(trainZ[mbi*btsz:(mbi+1)*btsz], dtrgts[mbi*btsz:(mbi+1)*btsz])
+            neglog, cerror = train[t](data[mbi*btsz:(mbi+1)*btsz],
+                                   dtrgts[mbi*btsz:(mbi+1)*btsz])
+
+            cost += neglog
+            error += cerror
             
             # iteration number
             iter = (epoch - 1) * batches + mbi
 
             if (iter + 1) % validation_frequency == 0:
-                print('epoch %i, minibatch %i/%i, training set neglog %f, classification error %f' % (epoch, mbi + 1, batches, neglog,cerror))
+                print 'epoch', epoch
+                print('training neglog %f, classification error %f' 
+                      % (cost/batches,error/batches))
                 # compute zero-one loss on validation set
-                validation_losses = [validate(validZ[i*btsz:(i+1)*btsz],vtrgts[i*btsz:(i+1)*btsz]) for i in xrange(vbatches)]
-                this_validation_loss = np.mean(np.asarray(validation_losses),axis=0)
+                v_losses = [validate(valid[i*btsz:(i+1)*btsz],
+                          vtrgts[i*btsz:(i+1)*btsz]) for i in xrange(vbatches)]
+                v_loss = np.mean(np.asarray(v_losses),axis=0)
 
 
-                print('epoch %i, minibatch %i/%i, validation set neglog %f, classification error %f' % (epoch, mbi + 1, batches, this_validation_loss[0],this_validation_loss[1]))
+                print('  validation neglog %f, classification error %f'
+                      % (v_loss[0], v_loss[1]))
 
 
-                if this_validation_loss[0] < best_validation_loss:
+                if v_loss[0] < best_validation_loss:
                     #improve patience if loss improvement is good enough
-                    if this_validation_loss[0] < best_validation_loss * improvement_threshold:
-                        patience = max(patience, iter * patience_increase)
-                    best_validation_loss = this_validation_loss[0]
+                    if v_loss[0] < best_validation_loss * improvement:
+                        patience = max(patience, iter * patience_inc)
+                    best_validation_loss = v_loss[0]
                     best_iter = iter
 
                     # test it on the test set
-                    test_losses = [validate(testZ[i*btsz:(i+1)*btsz],ttrgts[i*btsz:(i+1)*btsz]) for i in xrange(tbatches)]
-                    test_score = np.mean(np.asarray(test_losses),axis=0)
+                    t_losses = [validate(test[i*btsz:(i+1)*btsz],
+                          ttrgts[i*btsz:(i+1)*btsz]) for i in xrange(tbatches)]
+                    t_score = np.mean(np.asarray(t_losses),axis=0)
 
-                    print('     epoch %i, minibatch %i/%i, test set neglog %f, classification error %f' % (epoch, mbi + 1, batches, test_score[0] , test_score[1]))
+                    print('    test neglog %f, classification error %f' 
+                          % (t_score[0] , t_score[1]))
 
             if patience <= iter:
                     done_looping = True
                     break
         end = time.clock()
-        print "Elapsed time for last epoch", end-start, "seconds"
-    
+        print "Elapsed time for last epoch", end-start, "seconds"    
+        if error < .02 * batches: 
+            t = 1
+            print '----------'
+            print 'Switched to fine-tuning'
+            print '----------'
 
 
 
-def classifier(Zinit):
-    Z = T.tensor4('Z')
-    y = T.ivector('y')
-    rng = np.random.RandomState()
-
-    # Construct the first convolutional pooling layer:
-    # filtering reduces the image size to (32-5+1,32-5+1)=(28,28)
-    # maxpooling reduces this further to (28/2,28/2) = (14,14)
-    # 4D output tensor is thus of shape (btsz,firstfilters,14,14) 100.20.14.14
-    firstfilters = 20
-    layer0 = LeNetConvPoolLayer(rng, Z,
-            image_shape=Zinit,
-            filter_shape=(firstfilters, Zinit[1], 5, 5), poolsize=(2, 2))
-
-    # Construct the second convolutional pooling layer
-    # filtering reduces the image size to (14 - 5 + 1, 14 - 5 + 1)=(10, 10)
-    # maxpooling reduces this further to (10/2,10/2) = (5, 5)
-    # 4D output tensor is thus of shape (btsz,50,5,5)
-    secondfilters=50    
-    layer1 = LeNetConvPoolLayer(rng, input=layer0.output,
-            image_shape=(Zinit[0], firstfilters, 14, 14),
-            filter_shape=(secondfilters, firstfilters, 5, 5), poolsize=(2, 2))
-
-    # the HiddenLayer being fully-connected, it operates on 2D matrices of
-    # shape (batch_size,num_pixels) (i.e matrix of rasterized images).
-    # This will generate a matrix of shape (btsz, 50*5*5) = (100, 1250)
-    layer2_input = layer1.output.flatten(2)
-
-    # construct a fully-connected sigmoidal layer
-    layer2 = HiddenLayer(rng, input=layer2_input,
-                         n_in=1250, n_out=500,
-                         activation=T.tanh    )
-
-    # classify the values of the fully-connected sigmoidal layer
-    layer3 = LogisticRegression(input=layer2.output, n_in=500, n_out=10)
-
-    # the cost we minimize during training is the NLL of the model
-    neglog = layer3.negative_log_likelihood(y)
-    cerror =  layer3.errors(y)
-    # create a list of all model parameters to be fit by gradient descent
-    params = layer3.params + layer2.params + layer1.params + layer0.params
-
-    return neglog, cerror, params, Z, y
-
-"""
-
-def runClassifier():
-    ####################
-    # READ AND FORMAT DATA
-    ####################    
+def getMNIST(square=False):
     mnist_f = gzip.open("mnist.pkl.gz",'rb')                              
     train_set, valid_set, test_set = cPickle.load(mnist_f)                
 
     dm = train_set[0].mean(axis=0)
-
-    data = (train_set[0] - dm).reshape(train_set[0].shape[0],1,28,28)
     dtrgts = train_set[1]
-    valid = (valid_set[0] - dm).reshape(valid_set[0].shape[0],1,28,28)
     vtrgts = valid_set[1]
-    test = (test_set[0] - dm).reshape(test_set[0].shape[0],1,28,28)
     ttrgts = test_set[1]
 
+    data = (train_set[0] - dm)
+    valid = (valid_set[0] - dm).reshape(valid_set[0].shape[0],1,28,28)
+    test = (test_set[0] - dm).reshape(test_set[0].shape[0],1,28,28)
+
+    if square:
+        data = data.reshape(train_set[0].shape[0],1,28,28)
+        valid = valid.reshape(valid_set[0].shape[0],1,28,28)
+        test = test.reshape(test_set[0].shape[0],1,28,28)
+
     mnist_f.close()
-   
-    ####################
-    # SET LEARNING PARAMETERS
-    ####################  
-    epochs = 20
-    btsz = 100
-    lr = 1.
-    momentum = 0.9
-    decay = 0.95
-    batches = data.shape[0]/btsz
-    tbatches = test.shape[0]/btsz
-    vbatches = valid.shape[0]/btsz
-    print "LConvISTA -- Learned Convolutional ISTA"
-    print "Epochs", epochs
-    print "Batches per epoch", batches
-    print
 
-    ####################
-    # INITIALIZE ALGORITHM PARAMETERS
-    #################### 
-    n_filters = 25
-    filter_size = 5 #filters assumed to be square
-    layers = 10
-    weight_reconstruction = 1.
-    weight_sparsity = 1.
-    weight_neglog = 1.
-
-    err_weights = (weight_reconstruction,weight_sparsity,weight_neglog)
-
-    
-    Dinit = {"shape": (1,n_filters,filter_size,filter_size),
-             "variant": "normal", "std": 0.5}
-    D = crino.initweight(**Dinit)#np.random.randn(n_filters*s,s)#
-    # normalize atoms (SQUARE patches) to 1
-    D /= np.sqrt((D**2).sum(axis=-2,keepdims=True).sum(axis=-1,keepdims=True))
-    
-    theta = 0.001
-
-    L = 1.
-
-    zinit_shape = (btsz,n_filters,
-                   data[0,0].shape[0]+filter_size-1,
-                   data[0,0].shape[1]+filter_size-1)
-    Xshape = data[:btsz].shape
-
-
-    filter_size_W = 7
-    n_output_filters = np.round(n_filters/10.)
-    Winit =  {"shape": (n_output_filters,n_filters,filter_size_W,filter_size_W), "variant": "normal", "std": 0.5}
-    W = crino.initweight(**Winit)
-    W /= np.sqrt((W**2).sum(axis=-2,keepdims=True).sum(axis=-1,keepdims=True))
-    
-
-
-    config = {"D": D, "theta": theta, "L": L, "Zinit": zinit_shape,
-              "layers": layers, "Xshape": Xshape, "btsz": btsz,
-              "err_weights": err_weights, "WCNN": W}
-    
-    # normalize weights according to this config
-    norm_dic = {"D": {"axis":1, "c": 1.}}
-    # threshold theta should be at least some value
-    thresh_dic = {"theta": {"thresh": 1e-15}}
-
-
-    ####################
-    # BUILDING GRAPH
-    #################### 
-    X, y, params, header_params, Z, rec, costFE, costCL, cerror, re, sparsity, neglog = classifier(config=config, shrinkage=sh)
-    grads = T.grad(costFE,params)
-    grads += T.grad(costCL,header_params)
-    #grads = T.grad(costFE+costCL, params+header_params)
-    
-
-    # training ...
-    settings = {"lr": lr, "momentum": momentum, "decay": decay}
-    # ... with stochastic gradient + momentum
-    #updates = crino.momntm(params, grads, settings)#, **norm_dic)
-    updates = crino.adadelta(params+header_params, grads, settings)#, **norm_dic)
-    # ... normalize weights
-
-    updates[params[0]] = updates[params[0]] / T.sqrt(theano.map(lambda patch: (patch**2).sum(keepdims=True),updates[params[0]][0])[0])
-
-    # ... make sure threshold is big enough
-    updates = crino.max_updt(params, updates, todo=thresh_dic)
-
-
-
-    #header_updates = crino.adadelta(header_params, header_grads, settings)
-
-    train = theano.function([X,y], (costFE, re, sparsity) + tuple(params) + (costCL, neglog), updates=updates,allow_input_downcast=True)
-
-
-    #trainFE = theano.function([X],
-    #            (costFE, re, sparsity) + tuple(params),
-    #            updates=updates, allow_input_downcast=True)
-
-    #trainCL = theano.function([X,y],
-    #            (costCL, neglog) + tuple(header_params),
-    #            updates=header_updates, allow_input_downcast=True)
-
-    validate_or_test_model = theano.function([X,y],
-                cerror, allow_input_downcast=True)
-    print 'Graph built.'
-
-
-    ###############
-    # TRAIN MODEL #
-    ###############
-    print '... training'
-
-    # early-stopping parameters
-    patience = 10000  # look as this many examples regardless
-    patience_increase = 2  # wait this much longer when a new best is
-                           # found
-    improvement_threshold = 0.995  # a relative improvement of this much is
-                                   # considered significant
-    validation_frequency = min(batches, patience / 2)
-                                  # go through this many
-                                  # minibatche before checking the network
-                                  # on the validation set; in this case we
-                                  # check every epoch
-
-    
-    params = [None] * 3
-    best_params = params
-
-    best_validation_loss = np.inf
-    best_iter = 0
-    test_score = 0.
-    start_time = time.clock()
-
-    epoch = 0
-    done_looping = False
-
-    while (epoch < epochs) and (not done_looping):
-        start = time.clock()
-        epoch += 1
-        #FE = (epoch % 2 == 1) # feature extraction
-        #if FE:
-        #    print 'Training feature extraction'
-        #else:
-        #    print 'Training classification'
-        cost = 0
-        for mbi in xrange(batches):
-
-            #if FE:
-            #    costFE, re, sparsity, params[0], params[1], params[2] = trainFE(data[mbi*btsz:(mbi+1)*btsz])
-            #    cost += btsz*costFE
-            #else:
-            #    costCL, neglog, header_params[0], header_params[1], header_params[2] = trainCL(data[mbi*btsz:(mbi+1)*btsz],dtrgts[mbi*btsz:(mbi+1)*btsz])
-            #    cost += btsz*costCL
-
-            costFE, re, sparsity, params[0], params[1], params[2], costCL, neglog = train(data[mbi*btsz:(mbi+1)*btsz],dtrgts[mbi*btsz:(mbi+1)*btsz])
-            cost += btsz*(costFE+costCL)
-
-            # iteration number
-            iter = (epoch - 1) * batches + mbi
-
-            if (iter + 1) % validation_frequency == 0:
-                # compute zero-one loss on validation set
-                validation_losses = [validate_or_test_model(valid[i*btsz:(i+1)*btsz],vtrgts[i*btsz:(i+1)*btsz]) for i in xrange(vbatches)]
-                this_validation_loss = np.mean(validation_losses)
-                #if FE:
-                #    print re, sparsity
-                #else:
-                #    print neglog
-                print('epoch %i, minibatch %i/%i, validation error %f %%' % (epoch, mbi + 1, batches, this_validation_loss * 100.))
-
-
-                if this_validation_loss < best_validation_loss:
-                    #improve patience if loss improvement is good enough
-                    if this_validation_loss < best_validation_loss * improvement_threshold:
-                        best_params = params
-                        patience = max(patience, iter * patience_increase)
-
-                    best_validation_loss = this_validation_loss
-                    best_iter = iter
-
-                    # test it on the test set
-                    test_losses = [validate_or_test_model(test[i*btsz:(i+1)*btsz],ttrgts[i*btsz:(i+1)*btsz]) for i in xrange(tbatches)]
-                    test_score = np.mean(test_losses)
-
-                    print(('     epoch %i, minibatch %i/%i, test error of '
-                           'best model %f %%') %
-                          (epoch, mbi + 1, batches,
-                           test_score * 100.))
-
-            if patience <= iter:
-                    done_looping = True
-                    break
-        end = time.clock()
-        print "Elapsed time for last epoch", end-start, "seconds"
-            
-            
-    return best_params
-
-"""
+    return data, dtrgts, valid, vtrgts, test, ttrgts
 
 if __name__ == '__main__':
     testClassification()
