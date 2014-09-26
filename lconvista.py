@@ -4,19 +4,65 @@ import theano.tensor as T
 from theano.tensor.nnet.conv import conv2d as conv
 import gzip, cPickle
 import time
-from osdfutils import crino
+import crino
 import os
 from convolutional_mlp import HiddenLayer, LeNetConvPoolLayer, LogisticRegression
 from ksparse import kSparse
 
 
-def sh(x, theta):
+def sh(x, theta,k):
     """Simple shrinkage function.
     """
     return T.sgn(x) * T.maximum(0, T.abs_(x) - theta)
 
+def sh_ksparse(x, theta,k):
+    ksZ = kSparse(x,k,axis=1)
+    return sh(x,theta,k) - sh(ksZ,theta,k) + ksZ
 
-def lconvista(config, shrinkage):
+#class LConvISTA(object):
+#    def __init__(self, layers, k, D, D180, theta, L):
+    
+#        fs1 = _D.shape
+#        fs2 = _D180.shape
+
+#        D = theano.shared(value=np.asarray(D, 
+#                dtype=theano.config.floatX),borrow=True,name='D')
+#        D180 = theano.shared(value=np.asarray(D180, 
+#                dtype=theano.config.floatX),borrow=True,name='D180')
+#        theta = theano.shared(value=np.asarray(theta, 
+#                dtype=theano.config.floatX),borrow=True,name="theta")
+#        L = theano.shared(value=np.asarray(L, 
+#                dtype=theano.config.floatX),borrow=True,name="L")
+
+#        self.params = [D,D180,theta,L]
+
+#        #X.shape = (btsz, singleton dimension, h, w)
+#        self.X = T.tensor4('X', dtype=theano.config.floatX)
+#        #Z.shape = (btsz, n_filters, h+s-1, w+s-1)
+#        Z = T.zeros(config['Zinit'],dtype=theano.config.floatX)
+
+#        for i in range(layers):    
+#            gradZ = conv(
+#                        conv(
+#                                Z,D,border_mode='valid',
+#                                image_shape=config['Zinit'],filter_shape=fs1
+#                            ) - self.X,
+#                        D180,border_mode='full',
+#                        image_shape=config['Xshape'], filter_shape=fs2
+#                        )
+#            Z = shrinkage(Z - 1/L * gradZ,theta,k)
+
+#        self.Z = Z
+
+#        self.rec = conv(Z,D,border_mode='valid',
+#                        image_shape=config['Zinit'],filter_shape=_D.shape) 
+#        self.rec_error = 0.5*T.mean(((X-rec)**2).sum(axis=-1).sum(axis=-1))
+
+
+#        self.sparsity = T.mean(T.sum(T.sum(T.abs_(kSparse(Z,k,1) - Z),axis=-1),axis=-1))
+
+
+def lconvista(config):
     """Learned Convolutional ISTA   
 
     Returns TODO
@@ -59,6 +105,9 @@ def lconvista(config, shrinkage):
     # on CPU with 2 layers and 16 filters as well as 5 layers and 49 filters.
     # Note though that T.grad catches up with increasing parameters.
     # Hand calculated grad is preferred due to higher flexibility. 
+
+    shrinkage = sh_ksparse
+
     for i in range(layers):    
         gradZ = conv(
                     conv(
@@ -68,9 +117,7 @@ def lconvista(config, shrinkage):
                     D180,border_mode='full',
                     image_shape=config['Xshape'], filter_shape=fs2
                     )
-        step = Z - 1/L * gradZ
-        ksZ = kSparse(step,k)
-        Z = shrinkage(step,theta) - shrinkage(ksZ,theta) + ksZ
+        Z = shrinkage(Z - 1/L * gradZ,theta,k)
 
 
     def rec_error(X,Z,D):
@@ -83,66 +130,17 @@ def lconvista(config, shrinkage):
         return rec_error, rec
 
 
-    sparsity = T.mean(T.sum(T.sum(T.abs_(kSparse(Z,k) - Z),axis=-1),axis=-1))
-    re, rec = rec_error(X,Z,D)    
+    sparsity = T.mean(T.sum(T.sum(T.abs_(kSparse(Z,k,1) - Z),axis=-1),axis=-1))
+    re, rec = rec_error(X,Z,D) 
 
     return X, params, Z, rec, re, sparsity
 
-
-def classifier(Z, Zinit):
-   # Z = T.tensor4('Z')
-    y = T.ivector('y')
-
-    rng = np.random.RandomState()
-
-    # Construct the first convolutional pooling layer:
-    # filtering reduces the image size to (32-5+1,32-5+1)=(28,28)
-    # maxpooling reduces this further to (28/2,28/2) = (14,14)
-    # 4D output tensor is thus of shape (btsz,firstfilters,14,14)
-    firstfilters = 20
-    layer0 = LeNetConvPoolLayer(rng, Z,
-            image_shape=Zinit,
-            filter_shape=(firstfilters, Zinit[1], 5, 5), poolsize=(1, 1))
-
-    # Construct the second convolutional pooling layer
-    # filtering reduces the image size to (14-5+1,14-5+1)=(10, 10)
-    # maxpooling reduces this further to (10/2,10/2) = (5, 5)
-    # 4D output tensor is thus of shape (btsz,secondfilters,5,5)
-    secondfilters=50    
-    layer1 = LeNetConvPoolLayer(rng, input=layer0.output,
-            image_shape=(Zinit[0], firstfilters, 28, 28),
-            filter_shape=(secondfilters, firstfilters, 5, 5), poolsize=(1, 1))
-
-    # the HiddenLayer being fully-connected, it operates on 2D matrices of
-    # shape (batch_size,num_pixels) (i.e matrix of rasterized images).
-    # This will generate a matrix of shape (btsz, secondfilters*5*5)
-    layer2_input = layer1.output.flatten(2)
-
-    # construct a fully-connected sigmoidal layer
-    layer2 = HiddenLayer(rng, input=layer2_input,
-                         n_in=50*24*24, n_out=500,
-                         activation=T.tanh)
-
-    # classify the values of the fully-connected sigmoidal layer
-    layer3 = LogisticRegression(input=layer2.output, n_in=500, n_out=10)
-
-    # the cost we minimize during training is the NLL of the model
-    neglog = layer3.negative_log_likelihood(y)
-    cerror =  layer3.errors(y)
-    # create a list of all model parameters to be fit by gradient descent
-    params = layer3.params + layer2.params + layer1.params + layer0.params
-
-    return neglog, cerror, params, Z, y
-
-
-def trainFE(l,f,fs,e,k):
-    data, dtrgts, valid, vtrgts, test, ttrgts =  getMNIST(square=True)
+def trainFE(layers,n_filters,filter_size,k,L,epochs,btsz,lmbd):
+    data, dtrgts, valid, vtrgts, test, ttrgts, dm =  getMNIST(square=True)
     ####################
     # SET LEARNING PARAMETERS
     ####################  
-    epochs = e
-    btsz = 100
-    lr = .05
+    lr = .1
     momentum = 0.9
     decay = 0.95
     batches = data.shape[0]/btsz
@@ -150,22 +148,14 @@ def trainFE(l,f,fs,e,k):
     vbatches = valid.shape[0]/btsz
     print "LConvISTA -- Learned Convolutional ISTA"
     print "Epochs", epochs
-    print "Batches per epoch", batches
+    print "Batches per epoch", batches, "of size", btsz
     print
 
     ####################
     # INITIALIZE ALGORITHM PARAMETERS
     #################### 
-    n_filters = f
-    filter_size = fs #filters assumed to be square
-    layers = l
-    k = k
-    w_re = 1.
-    w_sparsity = 1.
-    print('%i filters of size %i x %i, %i layers' %
-          (n_filters, filter_size, filter_size, layers))
-
-    
+    print('%i filters of size %i x %i, %i layers\nkSparse with k=%i, sparsity weighted with lambda=%f' %
+          (n_filters, filter_size, filter_size, layers,k,lmbd))
     
     Dinit = {"shape": (1,n_filters,filter_size,filter_size),
              "variant": "normal", "std": 0.5}
@@ -174,8 +164,8 @@ def trainFE(l,f,fs,e,k):
     D /= np.sqrt((D**2).sum(axis=-2,keepdims=True).sum(axis=-1,keepdims=True))
 
     D180 = D[:,:,::-1,::-1].swapaxes(0,1)#D[:,:,::-1,::-1].dimshuffle(1,0,2,3)
-    L = 50.#25.#1.    
-    theta = w_sparsity / L#0.001
+    L = L
+    theta = lmbd / L
 
 
 
@@ -198,8 +188,8 @@ def trainFE(l,f,fs,e,k):
     ####################
     # BUILDING GRAPH
     #################### 
-    X, params, Z, rec, re, sparsity = lconvista(config,sh)
-    cost = w_re * re + w_sparsity * sparsity
+    X, params, Z, rec, re, sparsity = lconvista(config)
+    cost = re + lmbd * sparsity
     grads = T.grad(cost,params)
 
     # training ...
@@ -264,7 +254,6 @@ def trainFE(l,f,fs,e,k):
             
             # iteration number
             iter = (epoch - 1) * batches + mbi
-
             if (iter + 1) % validation_frequency == 0:
                 print np.asarray(params[3]), np.asarray(params[2])
                 print('epoch %i, minibatch %i/%i, training set reconstruction error %f, sparsity %f, total error %f' % (epoch, mbi + 1, batches, re, sparsity, cost))
@@ -294,27 +283,75 @@ def trainFE(l,f,fs,e,k):
                     done_looping = True
                     break
         end = time.clock()
-        print "Elapsed time for last epoch", end-start, "seconds"
-        name = 'epochs%i_layers%i_k%i_filters%i_shape%i_lambda%f' % (epochs,layers,k,n_filters,filter_size,w_sparsity)
+        hours = int((end-start) / 3600)
+        mins = int((end-start) / 60) - hours * 60
+        secs = end - start - hours *3600 - mins *60
+        print "Elapsed time for last epoch: %ih, %im, %fs" % (hours,mins,secs)
+        name = 'epochs%i_layers%i_k%i_filters%i_shape%i_lambda%f_L%i' % (epochs,layers,k,n_filters,filter_size,lmbd,L/1)
         directory = "experiments/"+name
         if not os.path.exists(directory):
             os.makedirs(directory)
         filename = "sparse_epoch%i.pkl.gz" % (epoch)
         file = gzip.open("experiments/"+name+"/"+filename,'wb')
-        cPickle.dump(best_params + [l,f,fs,k], file)  
+        cPickle.dump(best_params + [layers,n_filters,filter_size,k], file)  
         file.close()       
             
     return best_params,Z
 
 
+
+
+def classifier(Z, Zinit):
+   # Z = T.tensor4('Z')
+    y = T.ivector('y')
+
+    #rng = np.random.RandomState()
+
+    ## Construct the first convolutional pooling layer:
+    ## filtering reduces the image size to (32-5+1,32-5+1)=(28,28)
+    ## maxpooling reduces this further to (28/2,28/2) = (14,14)
+    ## 4D output tensor is thus of shape (btsz,firstfilters,14,14)
+    #firstfilters = 20
+    #layer0 = LeNetConvPoolLayer(rng, Z,
+    #        image_shape=Zinit,
+    #        filter_shape=(firstfilters, Zinit[1], 5, 5), poolsize=(1, 1))
+
+    ## Construct the second convolutional pooling layer
+    ## filtering reduces the image size to (14-5+1,14-5+1)=(10, 10)
+    ## maxpooling reduces this further to (10/2,10/2) = (5, 5)
+    ## 4D output tensor is thus of shape (btsz,secondfilters,5,5)
+    #secondfilters=50    
+    #layer1 = LeNetConvPoolLayer(rng, input=layer0.output,
+    #        image_shape=(Zinit[0], firstfilters, 30, 30),
+    #        filter_shape=(secondfilters, firstfilters, 5, 5), poolsize=(1, 1))
+
+    ## the HiddenLayer being fully-connected, it operates on 2D matrices of
+    ## shape (batch_size,num_pixels) (i.e matrix of rasterized images).
+    ## This will generate a matrix of shape (btsz, secondfilters*5*5)
+    #layer2_input = layer1.output.flatten(2)
+
+    ## construct a fully-connected sigmoidal layer
+    #layer2 = HiddenLayer(rng, input=layer2_input,
+    #                     n_in=50*26*26, n_out=500,
+    #                     activation=T.tanh)
+
+    ## classify the values of the fully-connected sigmoidal layer
+    #layer3 = LogisticRegression(input=layer2.output, n_in=500, n_out=10)
+
+    layer3 = LogisticRegression(input=T.flatten(Z,outdim=2), n_in=int(Zinit[1]*Zinit[2]*Zinit[3]), n_out=10)
+
+    # the cost we minimize during training is the NLL of the model
+    neglog = layer3.negative_log_likelihood(y)
+    cerror =  layer3.errors(y)
+    # create a list of all model parameters to be fit by gradient descent
+    params = layer3.params# + layer2.params + layer1.params + layer0.params
+
+    return neglog, cerror, params, Z, y
+
 def testClassification():
-    data, dtrgts, valid, vtrgts, test, ttrgts =  getMNIST(square=True)
+    data, dtrgts, valid, vtrgts, test, ttrgts, dm =  getMNIST(square=True)
 
-    layers = 10
-    n_filters = 16
-    filter_size = 5
-
-    file = "experiments/epochs100_layers10_filters16_shape5/sparse.pkl.gz"  
+    file = "experiments\epochs99_layers10_k1_filters16_shape7_lambda1.000000_L10\sparse_epoch28.pkl.gz"  
     f = gzip.open(file,'rb')                              
     params = cPickle.load(f)                
     f.close()
@@ -322,22 +359,21 @@ def testClassification():
     D180 = np.asarray(params[1],dtype=theano.config.floatX)
     theta = np.asarray(params[2],dtype=theano.config.floatX)
     L = np.asarray(params[3],dtype=theano.config.floatX)
+    layers = params[4]
+    n_filters = params[5]
+    filter_size = params[6]
+    k = params[7]
 
     btsz = 100
     zinit_shape = (btsz,n_filters,
                    data[0,0].shape[0]+filter_size-1,
                    data[0,0].shape[1]+filter_size-1)
-    
+
     config = {"D": D, "D180": D180, "theta": theta, "L": L, "Zinit": zinit_shape,
-              "layers": layers, "Xshape": (btsz,1,28,28), "btsz": btsz}
+              "layers": layers, "Xshape": (btsz,1,28,28), "btsz": btsz, "k":k}
 
 
-
-
-
-
-
-    X, params, Z, rec, re, sparsity = lconvista(config,sh)
+    X, params, Z, rec, re, sparsity = lconvista(config)
     #extract = theano.function([X], Z, allow_input_downcast=True)
 
     neglog, cerror, cparams, Z, y = classifier(Z, zinit_shape)
@@ -395,14 +431,6 @@ def testClassification():
 
 
 
-
-
-
-
-
-
-
-
 def classificationTraining(data, dtrgts, valid, vtrgts, test, ttrgts,
                            btsz, train, validate, epochs=20, patience=2500,
                            patience_inc=1.6,  improvement=0.995):
@@ -439,15 +467,13 @@ def classificationTraining(data, dtrgts, valid, vtrgts, test, ttrgts,
         error = 0
 
         for mbi in xrange(batches):
-            neglog, cerror = train[t](data[mbi*btsz:(mbi+1)*btsz],
-                                   dtrgts[mbi*btsz:(mbi+1)*btsz])
-
+            neglog, cerror = train[t](data[mbi*btsz:(mbi+1)*btsz], dtrgts[mbi*btsz:(mbi+1)*btsz])
+            print cerror
             cost += neglog
             error += cerror
             
             # iteration number
             iter = (epoch - 1) * batches + mbi
-
             if (iter + 1) % validation_frequency == 0:
                 print 'epoch', epoch
                 print('training neglog %f, classification error %f' 
@@ -482,7 +508,7 @@ def classificationTraining(data, dtrgts, valid, vtrgts, test, ttrgts,
                     break
         end = time.clock()
         print "Elapsed time for last epoch", end-start, "seconds"    
-        if error < .02 * batches: 
+        if (t == 0 and error < .02 * batches): 
             t = 1
             print '----------'
             print 'Switched to fine-tuning'
@@ -500,17 +526,21 @@ def getMNIST(square=False):
     ttrgts = test_set[1]
 
     data = (train_set[0] - dm)
-    valid = (valid_set[0] - dm).reshape(valid_set[0].shape[0],1,28,28)
-    test = (test_set[0] - dm).reshape(test_set[0].shape[0],1,28,28)
+    valid = (valid_set[0] - dm)
+    test = (test_set[0] - dm)
+    #data = train_set[0]
+    #valid = valid_set[0]
+    #test = test_set[0]
 
     if square:
         data = data.reshape(train_set[0].shape[0],1,28,28)
         valid = valid.reshape(valid_set[0].shape[0],1,28,28)
         test = test.reshape(test_set[0].shape[0],1,28,28)
+        dm = dm.reshape(1,1,28,28)
 
     mnist_f.close()
 
-    return data, dtrgts, valid, vtrgts, test, ttrgts
+    return data, dtrgts, valid, vtrgts, test, ttrgts, dm
 
 if __name__ == '__main__':
     testClassification()
