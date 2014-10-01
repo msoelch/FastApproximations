@@ -30,20 +30,26 @@ class KSparseGrad(theano.Op):
         return node
      
     def perform(self, node, inputs, output_storage):
-        I, k, axis, dCdH = inputs
+        I, k, axes, dCdH = inputs
         #print "KSparse python code"
-        nfmaps = I.shape[axis]
-        npixels = np.asarray(I.shape[axis+1:]).prod(dtype=int)
-        nsamples = np.asarray(I.shape[:axis]).prod(dtype=int)
+        first=axis[0]
+        last=axis[1]
+
+        nfmaps = np.asarray(I.shape[first:last+1]).prod(dtype=int)
+        npixels = np.asarray(I.shape[last+1:]).prod(dtype=int)
+        nsamples = np.asarray(I.shape[:first]).prod(dtype=int)
         lsample = npixels * nfmaps
 
         indices = np.zeros(nfmaps,dtype=np.int_)
+
         H = np.zeros(I.size)
 
         for s in range(nsamples):
             for p in range(npixels):
+                
                 for fm in range(nfmaps):
                     indices[fm] = s * lsample + p + fm * npixels
+
                 sortinds = np.argsort(-(I.reshape(I.size)[indices]))
                 indices = indices[sortinds]
                 H[indices[:k]] = dCdH.reshape(dCdH.size)[indices[:k]]
@@ -51,7 +57,7 @@ class KSparseGrad(theano.Op):
         output_storage[0][0] = H.reshape(I.shape)
 
     def c_code(self, node, nodename, inputs, outputs, sub):
-        I, k, axis, dCdH = inputs
+        I, k, axes, dCdH = inputs
         H = outputs[0]
 
         codeSource =  """
@@ -60,37 +66,34 @@ class KSparseGrad(theano.Op):
                 #define SWAP(ai,bi) ind_temp=(arr_ind[ai]);(arr_ind[ai])=(arr_ind[bi]);(arr_ind[bi])=ind_temp;
                 int i, ir, j, l, mid, ind_temp, s, p, fm;
 
-                const dtype_%(axis)s axis = *(dtype_%(axis)s*) PyArray_GETPTR1(%(axis)s,0);
-                const dtype_%(k)s k = *(dtype_%(k)s*) PyArray_GETPTR1(%(k)s,0);
-                dtype_%(I)s * arr = (dtype_%(I)s*)PyArray_DATA(%(I)s);
+                dtype_%(axes)s * axes = (dtype_%(axes)s*) PyArray_DATA(%(axes)s);
+                dtype_%(k)s k = *(dtype_%(k)s*) PyArray_GETPTR1(%(k)s,0);
+                dtype_%(I)s * arr = (dtype_%(I)s*) PyArray_DATA(%(I)s);
                 dtype_%(dCdH)s * dCdH = (dtype_%(dCdH)s*)PyArray_DATA(%(dCdH)s);
-
-                //dtype_%(k)s * k = (dtype_%(k)s*)PyArray_DATA(%(k)s);
-                //dtype_%(axis)s * axis = (dtype_%(axis)s*)PyArray_DATA(%(axis)s);
+           
 
                 const int ndims = PyArray_NDIM(%(I)s);
-                //const npy_intp shape = PyArray_DIMS(%(I)s);
+           
 
+                int first = axes[0];
+                int last = axes[1];
         
 
-                const int nfmaps = PyArray_DIM(%(I)s, axis);
+                unsigned int nfmaps = 1;
+                for (i = first; i < last + 1; i++)
+                    nfmaps *= PyArray_DIM(%(I)s, i);
+
 
                 unsigned int npixels = 1;
-                
-                
-
-                //const dtype_%(I)s arr = *(dtype_%(I)s*) PyArray_GETPTR1(%(I)s,0);
-
-                
-
-	            for (i = axis + 1; i < ndims; i++)
+	            for (i = last + 1; i < ndims; i++)
 		            npixels *= PyArray_DIMS(%(I)s)[i];
+
 
                 const unsigned int lsample = npixels * nfmaps;
 
+
                 unsigned int nsamples = 1;
-            
-                for (i = 0; i < axis; i++)
+                for (i = 0; i < first; i++)
         	        nsamples *= PyArray_DIMS(%(I)s)[i];
 
        
@@ -98,7 +101,7 @@ class KSparseGrad(theano.Op):
                 dtype_%(H)s * H = (dtype_%(H)s*)PyArray_DATA(%(H)s);
 
 
-                unsigned int arr_ind[PyArray_DIMS(%(I)s)[axis]];
+                unsigned int arr_ind[nfmaps];
             
 	            for (s = 0; s < nsamples; s++) {
 		            for (p = 0; p < npixels; p++) {
@@ -117,7 +120,7 @@ class KSparseGrad(theano.Op):
 					            if (ir == l + 1 && arr[arr_ind[ir]] > arr[arr_ind[l]]) {
 						            SWAP(l, ir);
 					            }
-					            break;
+					            break;//return arr[arr_ind[%(k)s]];
 				            }
 				            else {
 					            mid = (l + ir) >> 1;
@@ -239,12 +242,15 @@ class KSparse(theano.Op):
         return [ dCdI, dCdk, dCdaxis ]
         
     def perform(self, node, inputs, output_storage):
-        I, k, axis = inputs
+        I, k, axes = inputs
         #print "KSparse python code"
         
-        nfmaps = I.shape[axis]
-        npixels = np.asarray(I.shape[axis+1:]).prod(dtype=int)
-        nsamples = np.asarray(I.shape[:axis]).prod(dtype=int)
+        first=axis[0]
+        last=axis[1]
+
+        nfmaps = np.asarray(I.shape[first:last+1]).prod(dtype=int)
+        npixels = np.asarray(I.shape[last+1:]).prod(dtype=int)
+        nsamples = np.asarray(I.shape[:first]).prod(dtype=int)
         lsample = npixels * nfmaps
 
         indices = np.zeros(nfmaps,dtype=np.int_)
@@ -261,12 +267,10 @@ class KSparse(theano.Op):
                 indices = indices[sortinds]
 
                 H[indices[:k]] = I.reshape(I.size)[indices[:k]]
-        
-        output_storage[0][0] = H.reshape(I.shape)
 
 
     def c_code(self, node, nodename, inputs, outputs, sub):
-        I, k, axis = inputs
+        I, k, axes = inputs
         H = outputs[0]
 
         codeSource =  """
@@ -275,35 +279,33 @@ class KSparse(theano.Op):
                 #define SWAP(ai,bi) ind_temp=(arr_ind[ai]);(arr_ind[ai])=(arr_ind[bi]);(arr_ind[bi])=ind_temp;
                 int i, ir, j, l, mid, ind_temp, s, p, fm;
 
-                const dtype_%(axis)s axis = *(dtype_%(axis)s*) PyArray_GETPTR1(%(axis)s,0);
-                const dtype_%(k)s k = *(dtype_%(k)s*) PyArray_GETPTR1(%(k)s,0);
-                dtype_%(I)s * arr = (dtype_%(I)s*)PyArray_DATA(%(I)s);
-                //dtype_%(k)s * k = (dtype_%(k)s*)PyArray_DATA(%(k)s);
-                //dtype_%(axis)s * axis = (dtype_%(axis)s*)PyArray_DATA(%(axis)s);
+                dtype_%(axes)s * axes = (dtype_%(axes)s*) PyArray_DATA(%(axes)s);
+                dtype_%(k)s k = *(dtype_%(k)s*) PyArray_GETPTR1(%(k)s,0);
+                dtype_%(I)s * arr = (dtype_%(I)s*) PyArray_DATA(%(I)s);
+           
 
                 const int ndims = PyArray_NDIM(%(I)s);
-                //const npy_intp shape = PyArray_DIMS(%(I)s);
+           
 
+                int first = axes[0];
+                int last = axes[1];
         
 
-                const int nfmaps = PyArray_DIM(%(I)s, axis);
+                unsigned int nfmaps = 1;
+                for (i = first; i < last + 1; i++)
+                    nfmaps *= PyArray_DIM(%(I)s, i);
+
 
                 unsigned int npixels = 1;
-                
-                
-
-                //const dtype_%(I)s arr = *(dtype_%(I)s*) PyArray_GETPTR1(%(I)s,0);
-
-                
-
-	            for (i = axis + 1; i < ndims; i++)
+	            for (i = last + 1; i < ndims; i++)
 		            npixels *= PyArray_DIMS(%(I)s)[i];
+
 
                 const unsigned int lsample = npixels * nfmaps;
 
+
                 unsigned int nsamples = 1;
-            
-                for (i = 0; i < axis; i++)
+                for (i = 0; i < first; i++)
         	        nsamples *= PyArray_DIMS(%(I)s)[i];
 
        
@@ -311,7 +313,7 @@ class KSparse(theano.Op):
                 dtype_%(H)s * H = (dtype_%(H)s*)PyArray_DATA(%(H)s);
 
 
-                unsigned int arr_ind[PyArray_DIMS(%(I)s)[axis]];
+                unsigned int arr_ind[nfmaps];
             
 	            for (s = 0; s < nsamples; s++) {
 		            for (p = 0; p < npixels; p++) {
